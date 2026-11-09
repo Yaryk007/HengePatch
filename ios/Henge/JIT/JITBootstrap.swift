@@ -25,6 +25,15 @@ private let CS_DEBUGGED = UInt32(0x10000000)
 /// script from an app extension.
 enum JITBootstrap {
     private static let log = Logger(subsystem: "com.henge.app", category: "jit")
+    /// Reserving and testing a 1--1.5 GiB region is deliberately expensive.  It
+    /// must never run in a SwiftUI callback: doing that made the whole app stop
+    /// responding as soon as a JIT helper attached, before the user could start
+    /// their Mac.  One serial worker also prevents the active-scene callback and
+    /// the helper-attachment callback from claiming two regions at once.
+    private static let prewarmQueue = DispatchQueue(label: "com.henge.app.jit-prewarm",
+                                                    qos: .userInitiated)
+    private static let prewarmLock = NSLock()
+    nonisolated(unsafe) private static var prewarmQueued = false
 
     enum State: Equatable {
         case unknown
@@ -81,7 +90,7 @@ enum JITBootstrap {
     /// executable memory at all, and asking again later is precisely what does
     /// not work. So claim it first and hold it.
     @discardableResult
-    static func prewarm() -> Bool {
+    static func prewarm(stikDebugCanServiceTraps: Bool? = nil) -> Bool {
         if prewarmed { return true }
         // Before iOS 26 Henge can make the region itself where the device allows it (a jailbreak,
         // a debugger that attached and let go such as TrollStore's enable-jit, or dynamic-codesigning),
@@ -96,7 +105,7 @@ enum JITBootstrap {
         // attaches for 100 ms and services nothing, and a brk in that window stops Henge for good (TrollStore then says
         // "trollstorehelper returned 3"). A debugged process there makes its own executable memory anyway: QEMU maps its
         // buffer with MAP_JIT and the translation layer makes its region itself.
-        if canGrantOwnJIT && !stikDebugMayServiceTraps {
+        if canGrantOwnJIT && !(stikDebugCanServiceTraps ?? stikDebugMayServiceTraps) {
             selfGrantTried = true
             if mapJITWorks {
                 HengeLog.log("jit", "not trapping for a JIT region (no StikDebug); MAP_JIT executes here")
@@ -145,6 +154,30 @@ enum JITBootstrap {
         HengeLog.log("jit", ok ? "JIT region secured; it will be handed to QEMU later"
                               : "JIT prewarm FAILED -- StikDebug is not servicing traps")
         return ok
+    }
+
+    /// Claim the JIT region without blocking the app's main thread.
+    ///
+    /// This is the entry point for UI lifecycle and helper callbacks.  Keep the
+    /// synchronous `prewarm()` for non-UI callers that need an immediate answer.
+    static func prewarmInBackground() {
+        // UIApplication's URL-scheme query belongs on the main thread.  Capture
+        // the answer before moving only the allocation and trap work away.
+        let stikDebugCanServiceTraps = stikDebugMayServiceTraps
+        prewarmLock.lock()
+        guard !prewarmed, !prewarmQueued else {
+            prewarmLock.unlock()
+            return
+        }
+        prewarmQueued = true
+        prewarmLock.unlock()
+
+        prewarmQueue.async {
+            _ = JITBootstrap.prewarm(stikDebugCanServiceTraps: stikDebugCanServiceTraps)
+            JITBootstrap.prewarmLock.lock()
+            JITBootstrap.prewarmQueued = false
+            JITBootstrap.prewarmLock.unlock()
+        }
     }
 
     /// Whether to leave StikDebug attached after the region is held.

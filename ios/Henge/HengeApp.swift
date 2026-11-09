@@ -67,12 +67,16 @@ struct RootView: View {
         .sheet(isPresented: $jit.showSetup) { JITSetupFlow() }
         .onChange(of: scenePhase) { phase in
             guard phase == .active else { return }
-            // Back from StikDebug or TrollStore: claim the JIT region while the debugger is there.
-            JITBootstrap.prewarm()
+            // Back from StikDebug or TrollStore: claim the JIT region while the
+            // debugger is there. This can allocate more than a GiB, so never
+            // make SwiftUI's main thread wait for it.
+            JITBootstrap.prewarmInBackground()
             machines.collectImports()
             jit.enableAtLaunchIfAsked()
         }
-        .onChange(of: jit.attachGeneration) { _ in JITBootstrap.prewarm() } // the built-in helper attached
+        // The built-in helper attached. Its region claim is serialized with the
+        // scene-active callback above and happens off the UI thread.
+        .onChange(of: jit.attachGeneration) { _ in JITBootstrap.prewarmInBackground() }
         .task { // testing only: HENGE_AUTOPILOT
             await Autopilot.run { mac in
                 // A session still on screen (its Mac stopped) is closed first: the same value again would start nothing.
